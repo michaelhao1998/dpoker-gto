@@ -3135,10 +3135,12 @@ function evaluate7(cards) {
 // MONTE CARLO EQUITY (FIX P1: Web Worker via Blob + FIX P3: seeded PRNG)
 // ============================================================
 
-/** Seeded shuffle using provided rng function */
-function seededShuffle(arr, rng) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
+/** Seeded shuffle using provided rng function - partial shuffle optimization */
+function seededShuffle(arr, rng, count) {
+  // Only shuffle 'count' elements if specified (partial Fisher-Yates)
+  const n = count ? Math.min(count, arr.length) : arr.length;
+  for (let i = 0; i < n; i++) {
+    const j = i + Math.floor(rng() * (arr.length - i));
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
@@ -3187,7 +3189,7 @@ function calculateEquity(heroCards, boardCards, opponentCount, simulations) {
     return calculateMultiwayEquity(heroCards, boardCards, oppCount, simulations);
   }
   
-  const N = simulations || 3000;
+  const N = simulations || 500;
   const usedCards = new Set([...heroCards, ...boardCards]);
   const deck = [];
   for (const s of SUITS) {
@@ -3198,16 +3200,27 @@ function calculateEquity(heroCards, boardCards, opponentCount, simulations) {
   }
 
   const boardNeeded = 5 - boardCards.length;
+  const cardsNeeded = boardNeeded + oppCount * 2; // Only shuffle what we need
   const seed = hashCards(heroCards, boardCards);
   const rng = mulberry32(seed);
 
-  // Opponent range filter: reject hands outside typical range for the scenario
+  // Opponent range filter
   const oppRangeFilter = buildOppRangeFilter();
+
+  // Pre-allocate arrays to reduce GC pressure
+  const fullBoard = new Array(5);
+  for (let i = 0; i < boardCards.length; i++) fullBoard[i] = boardCards[i];
+  const heroHand = new Array(7);
+  heroHand[0] = heroCards[0];
+  heroHand[1] = heroCards[1];
 
   let wins = 0, ties = 0, validSims = 0;
   for (let sim = 0; sim < N * 2 && validSims < N; sim++) {
-    seededShuffle(deck, rng);
-    const fullBoard = [...boardCards, ...deck.slice(0, boardNeeded)];
+    // Partial shuffle - only shuffle the cards we need
+    seededShuffle(deck, rng, cardsNeeded);
+    
+    // Fill board
+    for (let i = 0; i < boardNeeded; i++) fullBoard[boardCards.length + i] = deck[i];
     let offset = boardNeeded;
 
     // Check if opponent hands pass range filter
@@ -3221,12 +3234,18 @@ function calculateEquity(heroCards, boardCards, opponentCount, simulations) {
     validSims++;
 
     offset = boardNeeded;
-    const heroScore = evaluate7([...heroCards, ...fullBoard]);
+    // Reuse heroHand array
+    for (let i = 0; i < 5; i++) heroHand[2 + i] = fullBoard[i];
+    const heroScore = evaluate7(heroHand);
+    
     let heroBest = true, tieCount = 0;
+    const oppHand7 = new Array(7);
     for (let opp = 0; opp < oppCount; opp++) {
-      const oppHand = [deck[offset], deck[offset+1]];
+      oppHand7[0] = deck[offset];
+      oppHand7[1] = deck[offset+1];
+      for (let i = 0; i < 5; i++) oppHand7[2 + i] = fullBoard[i];
       offset += 2;
-      const oppScore = evaluate7([...oppHand, ...fullBoard]);
+      const oppScore = evaluate7(oppHand7);
       if (oppScore > heroScore) { heroBest = false; break; }
       if (oppScore === heroScore) tieCount++;
     }
@@ -3585,37 +3604,10 @@ function runCalculation() {
     
     return calculatePreflopGTO(handKey, pos, facing);
   } else {
-    // Postflop: Optimized calculation - use lightweight MCCFR or heuristic only
-    // Reduced iterations for postflop to improve performance
-    const equity = calculateEquity(state.heroCards, state.boardCards, oppCount, 1500);
-    
-    // Use lightweight MCCFR for better accuracy with fewer iterations
-    if (mccfrSolver) {
-      // Postflop uses fewer iterations (800 vs 2000) for performance
-      const mccfrResult = runMCCFRSolve(state, { iterations: 800, isPostflop: true });
-      const postflopResult = calculatePostflopGTO(equity, pot, stack, facing, pos);
-      
-      // Blend results with more weight on heuristic for speed
-      return {
-        fold: Math.round(mccfrResult.fold * 0.4 + postflopResult.fold * 0.6),
-        call: Math.round(mccfrResult.call * 0.4 + postflopResult.call * 0.6),
-        raise: Math.round(mccfrResult.raise * 0.4 + postflopResult.raise * 0.6),
-        bestAction: postflopResult.bestAction, // Use heuristic for best action
-        handKey,
-        handType: classifyHand(state.heroCards[0], state.heroCards[1]),
-        equity,
-        street,
-        boardTexture: analyzeBoard(state.boardCards),
-        confidence: postflopResult.confidence,
-        solverType: 'FastMCCFR+Heuristic',
-        draws: postflopResult.draws,
-        betSize: postflopResult.betSize,
-        potOdds: postflopResult.potOdds,
-        ev: postflopResult.ev,
-        impliedOddsBonus: postflopResult.impliedOddsBonus
-      };
-    }
-    
+    // Postflop: Use fast heuristic approach
+    // Monte Carlo equity (500 sims is enough for ~2% error) + heuristic strategy
+    // MCCFR is skipped for postflop - tree is too deep and slow for browser
+    const equity = calculateEquity(state.heroCards, state.boardCards, oppCount, 500);
     const postflopResult = calculatePostflopGTO(equity, pot, stack, facing, pos);
     return {
       ...postflopResult,
@@ -3623,7 +3615,8 @@ function runCalculation() {
       handType: classifyHand(state.heroCards[0], state.heroCards[1]),
       equity,
       street,
-      boardTexture: analyzeBoard(state.boardCards)
+      boardTexture: analyzeBoard(state.boardCards),
+      solverType: 'Equity+GTO'
     };
   }
 }
