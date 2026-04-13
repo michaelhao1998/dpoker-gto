@@ -13,6 +13,19 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<!-- Fallback styles in case CDN fails -->
+<style>
+  /* Critical CSS fallback */
+  .cdn-fallback { display: none; }
+  @supports not (display: grid) {
+    .cdn-fallback { display: block; padding: 20px; text-align: center; }
+  }
+</style>
+<noscript>
+  <div style="padding: 20px; text-align: center; background: #1a1d2e; color: #fff;">
+    DPoker GTO 需要 JavaScript 才能运行。请启用 JavaScript 后刷新页面。
+  </div>
+</noscript>
 <script>
   tailwind.config = {
     theme: {
@@ -504,6 +517,40 @@ const SUITS = ['s','h','d','c']; // spade, heart, diamond, club
 const SUIT_SYMBOLS = { s:'\u2660', h:'\u2665', d:'\u2666', c:'\u2663' };
 const SUIT_COLORS = { s:'#E2E8F0', h:'#F87171', d:'#F87171', c:'#E2E8F0' };
 
+// ============================================================
+// SEEDED RANDOM NUMBER GENERATOR (Mulberry32)
+// Better randomness and reproducible results
+// ============================================================
+function mulberry32(seed) {
+  return function() {
+    let t = seed += 0x6D2B79F5;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Create seeded RNG for equity calculations
+// Use timestamp + hand signature as seed for variety but reproducibility within same hand
+function createSeededRNG(seed) {
+  return mulberry32(seed || Date.now());
+}
+
+// Global RNG cache to avoid recreating for same hand
+const rngCache = new Map();
+function getRNGForHand(handKey, boardKey = '') {
+  const key = handKey + boardKey;
+  if (!rngCache.has(key)) {
+    // Create seed from hand signature
+    let seed = 0;
+    for (let i = 0; i < key.length; i++) {
+      seed = (seed * 31 + key.charCodeAt(i)) >>> 0;
+    }
+    rngCache.set(key, mulberry32(seed));
+  }
+  return rngCache.get(key);
+}
+
 const STREET_BOARD_COUNTS = { preflop:0, flop:3, turn:4, river:5 };
 
 const FACING_ACTIONS = {
@@ -570,9 +617,35 @@ const state = {
 const HistoryManager = {
   STORAGE_KEY: 'dpoker_history_v1',
   MAX_HISTORY: 50,
+  MAX_STORAGE_SIZE: 4 * 1024 * 1024, // 4MB safety limit (localStorage typically 5-10MB)
+  
+  // Check localStorage availability and space
+  checkStorage() {
+    try {
+      const testKey = '__dpoker_storage_test__';
+      localStorage.setItem(testKey, 'test');
+      localStorage.removeItem(testKey);
+      return true;
+    } catch (e) {
+      console.warn('[DPoker] localStorage not available:', e);
+      return false;
+    }
+  },
+  
+  // Get current localStorage usage in bytes
+  getStorageUsage() {
+    let total = 0;
+    for (let key in localStorage) {
+      if (localStorage.hasOwnProperty(key)) {
+        total += localStorage[key].length * 2; // UTF-16 encoding
+      }
+    }
+    return total;
+  },
   
   // Load history from localStorage
   load() {
+    if (!this.checkStorage()) return [];
     try {
       const data = localStorage.getItem(this.STORAGE_KEY);
       return data ? JSON.parse(data) : [];
@@ -582,12 +655,39 @@ const HistoryManager = {
     }
   },
   
-  // Save history to localStorage
+  // Save history to localStorage with size check
   save(history) {
+    if (!this.checkStorage()) return false;
     try {
-      localStorage.setItem(this.STORAGE_KEY, JSON.stringify(history.slice(0, this.MAX_HISTORY)));
+      const trimmed = history.slice(0, this.MAX_HISTORY);
+      const data = JSON.stringify(trimmed);
+      
+      // Check if we're approaching storage limit
+      if (data.length * 2 > this.MAX_STORAGE_SIZE) {
+        console.warn('[DPoker] History data too large, reducing entries');
+        // Reduce to 30 entries if too large
+        const reduced = history.slice(0, 30);
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify(reduced));
+        return true;
+      }
+      
+      localStorage.setItem(this.STORAGE_KEY, data);
+      return true;
     } catch (e) {
+      if (e.name === 'QuotaExceededError') {
+        console.warn('[DPoker] Storage quota exceeded, clearing old history');
+        // Try to save with fewer entries
+        try {
+          const minimal = history.slice(0, 20);
+          localStorage.setItem(this.STORAGE_KEY, JSON.stringify(minimal));
+          return true;
+        } catch (e2) {
+          // Last resort: clear history
+          localStorage.removeItem(this.STORAGE_KEY);
+        }
+      }
       console.warn('[DPoker] Failed to save history:', e);
+      return false;
     }
   },
   
@@ -2400,13 +2500,19 @@ function initMCCFRSolver(options) {
  * Run MCCFR solve for current state with caching
  */
 function runMCCFRSolve(state, options = {}) {
-  const cacheKey = generateCacheKey(state);
+  const cacheKey = generateCacheKey(state, options.isPostflop);
   
   // Check cache first
   const cached = strategyCache.get(cacheKey);
   if (cached && cached.expiry > Date.now()) {
     console.log('[DPoker] Strategy cache hit');
     return cached.value;
+  }
+  
+  // Temporarily adjust iterations if specified
+  const originalIterations = mccfrSolver ? mccfrSolver.iterations : null;
+  if (mccfrSolver && options.iterations) {
+    mccfrSolver.iterations = options.iterations;
   }
   
   if (!mccfrSolver) {
@@ -2424,6 +2530,11 @@ function runMCCFRSolve(state, options = {}) {
   );
   
   const solveTime = performance.now() - startTime;
+  
+  // Restore original iterations
+  if (mccfrSolver && originalIterations) {
+    mccfrSolver.iterations = originalIterations;
+  }
   
   // Update performance metrics
   PERF_MONITOR.solveCount++;
@@ -2445,9 +2556,10 @@ function runMCCFRSolve(state, options = {}) {
 /**
  * Generate cache key for state
  */
-function generateCacheKey(state) {
+function generateCacheKey(state, isPostflop = false) {
   const cards = [...state.heroCards, ...state.boardCards].sort().join('');
-  return `${cards}|${state.position}|${state.facingAction}|${state.stackDepth}|${state.street}`;
+  const postfix = isPostflop ? '_pf' : ''; // Different cache for postflop with fewer iterations
+  return `${cards}|${state.position}|${state.facingAction}|${state.stackDepth}|${state.street}${postfix}`;
 }
 
 /**
@@ -3426,10 +3538,13 @@ document.getElementById('calcBtn').addEventListener('click', async function() {
   loading.classList.remove('hidden');
   panel.classList.remove('result-placeholder');
 
-  // Simulate calculation time for UX feel
-  await new Promise(r => setTimeout(r, 600 + Math.random() * 400));
+  // Use requestAnimationFrame to ensure UI updates before heavy calculation
+  await new Promise(resolve => requestAnimationFrame(resolve));
+  
+  // Small delay to allow spinner to render (50ms max)
+  await new Promise(r => setTimeout(r, 50));
 
-  // Run calculation
+  // Run calculation (actual time depends on complexity)
   const result = runCalculation();
 
   // Render result
@@ -3470,26 +3585,34 @@ function runCalculation() {
     
     return calculatePreflopGTO(handKey, pos, facing);
   } else {
-    // Postflop: Use MCCFR for better accuracy
-    const equity = calculateEquity(state.heroCards, state.boardCards, oppCount);
+    // Postflop: Optimized calculation - use lightweight MCCFR or heuristic only
+    // Reduced iterations for postflop to improve performance
+    const equity = calculateEquity(state.heroCards, state.boardCards, oppCount, 1500);
     
+    // Use lightweight MCCFR for better accuracy with fewer iterations
     if (mccfrSolver) {
-      const mccfrResult = runMCCFRSolve(state, { iterations: 2000 });
+      // Postflop uses fewer iterations (800 vs 2000) for performance
+      const mccfrResult = runMCCFRSolve(state, { iterations: 800, isPostflop: true });
       const postflopResult = calculatePostflopGTO(equity, pot, stack, facing, pos);
       
-      // Blend results
+      // Blend results with more weight on heuristic for speed
       return {
-        fold: Math.round(mccfrResult.fold * 0.6 + postflopResult.fold * 0.4),
-        call: Math.round(mccfrResult.call * 0.6 + postflopResult.call * 0.4),
-        raise: Math.round(mccfrResult.raise * 0.6 + postflopResult.raise * 0.4),
-        bestAction: mccfrResult.bestAction,
+        fold: Math.round(mccfrResult.fold * 0.4 + postflopResult.fold * 0.6),
+        call: Math.round(mccfrResult.call * 0.4 + postflopResult.call * 0.6),
+        raise: Math.round(mccfrResult.raise * 0.4 + postflopResult.raise * 0.6),
+        bestAction: postflopResult.bestAction, // Use heuristic for best action
         handKey,
         handType: classifyHand(state.heroCards[0], state.heroCards[1]),
         equity,
         street,
         boardTexture: analyzeBoard(state.boardCards),
-        confidence: mccfrResult.confidence,
-        solverType: 'MCCFR+Heuristic'
+        confidence: postflopResult.confidence,
+        solverType: 'FastMCCFR+Heuristic',
+        draws: postflopResult.draws,
+        betSize: postflopResult.betSize,
+        potOdds: postflopResult.potOdds,
+        ev: postflopResult.ev,
+        impliedOddsBonus: postflopResult.impliedOddsBonus
       };
     }
     
@@ -3761,21 +3884,41 @@ function getHeatmapStrength(hk){
 })();
 
 // ============================================================
-// PWA SERVICE WORKER REGISTRATION
+// PWA SERVICE WORKER REGISTRATION - Enhanced Caching
 // ============================================================
 (function registerServiceWorker() {
   if ('serviceWorker' in navigator) {
     const swCode = `
-      const CACHE_NAME = 'dpoker-gto-v1';
+      const CACHE_NAME = 'dpoker-gto-v2';
       const STATIC_ASSETS = [
         '/',
         '/index.html'
       ];
       
+      // Critical CDN resources to cache
+      const CDN_RESOURCES = [
+        'https://cdn.tailwindcss.com',
+        'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap',
+        'https://fonts.gstatic.com/s/spacegrotesk/v16/V8mQoQDjQSkFtoMM3T6r8E7mF71Q-gOoraIAEj7oUXskPMBBSSJLm2E.woff2',
+        'https://fonts.gstatic.com/s/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPVmUsaaDhw.woff2'
+      ];
+      
       self.addEventListener('install', event => {
         event.waitUntil(
           caches.open(CACHE_NAME).then(cache => {
-            return cache.addAll(STATIC_ASSETS);
+            // Cache static assets
+            const staticCache = cache.addAll(STATIC_ASSETS);
+            
+            // Try to cache CDN resources (may fail due to CORS, that's ok)
+            const cdnCache = Promise.allSettled(
+              CDN_RESOURCES.map(url => 
+                fetch(url, { mode: 'no-cors' })
+                  .then(response => cache.put(url, response))
+                  .catch(() => console.log('[SW] Failed to cache:', url))
+              )
+            );
+            
+            return Promise.all([staticCache, cdnCache]);
           })
         );
         self.skipWaiting();
@@ -3795,9 +3938,46 @@ function getHeatmapStrength(hk){
       });
       
       self.addEventListener('fetch', event => {
-        // Network-first strategy for API calls, cache-first for static
-        if (event.request.url.includes('cdn.tailwindcss.com') || 
-            event.request.url.includes('fonts.googleapis.com')) {
+        const url = event.request.url;
+        
+        // Strategy 1: CDN resources - Cache First, then Network
+        if (url.includes('cdn.tailwindcss.com') || 
+            url.includes('fonts.googleapis.com') ||
+            url.includes('fonts.gstatic.com')) {
+          event.respondWith(
+            caches.match(event.request).then(cached => {
+              // Return cached version immediately if available
+              if (cached) {
+                // Still try to update cache in background
+                fetch(event.request).then(response => {
+                  caches.open(CACHE_NAME).then(cache => {
+                    cache.put(event.request, response.clone());
+                  });
+                }).catch(() => {});
+                return cached;
+              }
+              
+              // Otherwise fetch and cache
+              return fetch(event.request).then(response => {
+                const responseClone = response.clone();
+                caches.open(CACHE_NAME).then(cache => {
+                  cache.put(event.request, responseClone);
+                });
+                return response;
+              });
+            }).catch(() => {
+              // If both fail, return a fallback or error
+              return new Response('Offline - Resource unavailable', { status: 503 });
+            })
+          );
+          return;
+        }
+        
+        // Strategy 2: Static assets - Cache First
+        if (event.request.mode === 'navigate' || 
+            url.endsWith('.html') || 
+            url.endsWith('.js') || 
+            url.endsWith('.css')) {
           event.respondWith(
             caches.match(event.request).then(response => {
               return response || fetch(event.request).then(fetchResponse => {
@@ -3806,11 +3986,21 @@ function getHeatmapStrength(hk){
                   return fetchResponse;
                 });
               });
-            })
+            }).catch(() => caches.match('/'))
           );
-        } else {
-          event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
+          return;
         }
+        
+        // Strategy 3: Everything else - Network First, then Cache
+        event.respondWith(
+          fetch(event.request).then(response => {
+            const responseClone = response.clone();
+            caches.open(CACHE_NAME).then(cache => {
+              cache.put(event.request, responseClone);
+            });
+            return response;
+          }).catch(() => caches.match(event.request))
+        );
       });
     `;
     
