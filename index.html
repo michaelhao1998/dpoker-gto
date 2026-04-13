@@ -444,14 +444,24 @@
       </div>
     </div>
 
-    <!-- 4. Pot Size -->
+    <!-- 4. Opponent Count & Pot Size -->
     <div class="bg-bgSecondary rounded-xl border border-border p-4 animate-in" style="animation-delay:.15s">
-      <div>
-        <div class="flex items-center justify-between mb-1">
-          <div class="section-label mb-0">底池大小</div>
-          <span id="potValue" class="text-accent font-mono text-sm font-bold">2.25 BB</span>
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex-1">
+          <div class="section-label">对手人数</div>
+          <div class="flex gap-1.5 mt-1">
+            <button class="opp-radio active" data-count="1">1</button>
+            <button class="opp-radio" data-count="2">2</button>
+            <button class="opp-radio" data-count="3">3</button>
+          </div>
         </div>
-        <input type="range" id="potSlider" min="1" max="200" value="2.25" step="0.25">
+        <div class="flex-1">
+          <div class="flex items-center justify-between mb-1">
+            <div class="section-label mb-0">底池大小</div>
+            <span id="potValue" class="text-accent font-mono text-sm font-bold">2.25 BB</span>
+          </div>
+          <input type="range" id="potSlider" min="1" max="200" value="2.25" step="0.25">
+        </div>
       </div>
     </div>
 
@@ -1091,6 +1101,17 @@ function renderFacingActions() {
     });
   });
 }
+
+// ============================================================
+// OPPONENT COUNT
+// ============================================================
+document.querySelectorAll('.opp-radio').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.opp-radio').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.opponentCount = parseInt(btn.dataset.count);
+  });
+});
 
 // ============================================================
 // POT SIZE SLIDER
@@ -3692,9 +3713,20 @@ function runCalculation() {
     
     return calculatePreflopGTO(handKey, pos, facing);
   } else {
-    // Postflop: ZERO Monte Carlo simulation - instant calculation
-    // Use hand strength evaluation + mathematical equity estimation
-    const equity = estimateEquityFast(state.heroCards, state.boardCards);
+    // Postflop strategy by opponent count:
+    // 1-2 opponents: Monte Carlo (500 sims, fast enough)
+    // 3 opponents: Instant estimation (multiway MC is too slow)
+    let equity;
+    let solverLabel;
+    if (oppCount <= 2) {
+      equity = calculateEquity(state.heroCards, state.boardCards, oppCount, 500);
+      solverLabel = 'MC500+GTO';
+    } else {
+      equity = estimateEquityFast(state.heroCards, state.boardCards);
+      // Multiway discount: more opponents = lower effective equity
+      equity = Math.round(equity * 0.82); // ~18% discount for 3-way
+      solverLabel = 'Instant GTO (3-way)';
+    }
     const postflopResult = calculatePostflopGTO(equity, pot, stack, facing, pos);
     return {
       ...postflopResult,
@@ -3703,7 +3735,7 @@ function runCalculation() {
       equity,
       street,
       boardTexture: analyzeBoard(state.boardCards),
-      solverType: 'Instant GTO'
+      solverType: solverLabel
     };
   }
 }
@@ -3871,7 +3903,7 @@ function renderPostflopDetails(result) {
     ${bt.wetness > 0.5 ? '<br>&bull; 湿润板面（花/顺可能性高），边缘成牌需谨慎。':''}
     ${bt.type === 'dry' ? '<br>&bull; 干燥板面，成牌价值更高，可适当激进。':''}
     ${result.betSize ? '<br>&bull; 推荐下注尺度: <strong>'+result.betSize+'</strong>':''}
-    <br><small class="text-slate-500 mt-2 block">即时手牌评估 + GTO 策略 | ${['BTN','CO'].includes(state.position)?'位置内(IP)':'位置外(OOP)'} | Heads-up</small>
+    <br><small class="text-slate-500 mt-2 block">${result.solverType || 'GTO策略'} | ${['BTN','CO'].includes(state.position)?'位置内(IP)':'位置外(OOP)'} | ${state.opponentCount}人底池</small>
   </div>`;
 }
 
