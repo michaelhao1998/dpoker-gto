@@ -552,14 +552,9 @@ const PREFLOP_ACTION_CATEGORIES = [
 ];
 
 // Level 2: Size options for each category
+// Note: 'open' (RFI) is single-level - strategy tells you what size to open
 const PREFLOP_SIZE_OPTIONS = {
-  open: [
-    { label: '2 BB', val: 'open_2', bb: 2.0 },
-    { label: '2.5 BB', val: 'open_2.5', bb: 2.5 },
-    { label: '3 BB', val: 'open_3', bb: 3.0 },
-    { label: '4 BB', val: 'open_4', bb: 4.0 },
-    { label: '5 BB', val: 'open_5', bb: 5.0 },
-  ],
+  open: null, // RFI uses single-level selection, strategy recommends size
   vslimp: [
     { label: '隔离 3 BB', val: 'vslimp_iso3', bb: 3.0 },
     { label: '隔离 4 BB', val: 'vslimp_iso4', bb: 4.0 },
@@ -1242,14 +1237,26 @@ function renderPreflopFacingActions() {
       catContainer.querySelectorAll('.action-option').forEach(o => o.classList.remove('active'));
       opt.classList.add('active');
       state.facingCategory = opt.dataset.val;
-      state.facingAction = null; // Reset level 2
-      renderPreflopSizeOptions();
-      validateAndEnableCalc();
+      
+      // RFI (open): single-level, strategy tells you the size
+      if (state.facingCategory === 'open') {
+        state.facingAction = 'open'; // Use generic open action
+        sizeContainer.classList.add('hidden');
+        // Auto-estimate pot size for RFI
+        state.potSize = 2.5; // Default RFI pot
+        document.getElementById('potSlider').value = 2.5;
+        document.getElementById('potValue').textContent = '2.5 BB';
+        validateAndEnableCalc();
+      } else {
+        // Other categories: need Level 2 size selection
+        state.facingAction = null;
+        renderPreflopSizeOptions();
+      }
     });
   });
   
-  // Render Level 2 if category selected
-  if (state.facingCategory) {
+  // Render Level 2 if category selected (and not RFI)
+  if (state.facingCategory && state.facingCategory !== 'open') {
     renderPreflopSizeOptions();
   } else {
     sizeContainer.classList.add('hidden');
@@ -1985,6 +1992,31 @@ function getTableWithStackDepth(baseTableName) {
   return PREFLOP_GTO_TABLE[baseTableName];
 }
 
+/** Get recommended open size based on position and hand strength */
+function getRecommendedOpenSize(handKey, position, raisePct) {
+  // Position-based base sizing
+  const posSizeMap = {
+    'UTG': 2.5, 'UTG+1': 2.5, 'UTG+2': 2.5,
+    'HJ': 2.2, 'CO': 2.2,
+    'BTN': 2.0, 'SB': 3.0
+  };
+  const baseSize = posSizeMap[position] || 2.5;
+  
+  // Hand strength adjustments
+  const isPremium = ['AA', 'KK', 'QQ', 'JJ', 'AKs', 'AKo'].includes(handKey);
+  const isStrong = raisePct >= 80;
+  const isMarginal = raisePct <= 30;
+  
+  // Premium hands: larger size for value
+  if (isPremium) return Math.min(5.0, baseSize + 0.5);
+  // Strong hands: standard+ size
+  if (isStrong) return Math.min(4.0, baseSize + 0.3);
+  // Marginal hands: smaller size or fold
+  if (isMarginal) return Math.max(2.0, baseSize - 0.5);
+  
+  return baseSize;
+}
+
 /** Pre-Flop GTO lookup with stack depth awareness */
 function calculatePreflopGTO(handKey, position, facingAction) {
   const baseTableName = getFacingTable(facingAction);
@@ -2025,12 +2057,19 @@ function calculatePreflopGTO(handKey, position, facingAction) {
   
   // Add stack depth info to result
   const stackLabel = isShortStack ? ' (短筹码 Push/Fold)' : (isDeepStack ? ' (深筹码)' : '');
+  
+  // For RFI: recommend open size
+  let recommendedSize = null;
+  if (isRFI && bestAction === 'raise') {
+    recommendedSize = getRecommendedOpenSize(handKey, position, raisePct);
+  }
 
   return {
     fold: foldPct, call: callPct, raise: raisePct,
     bestAction, ev: entry.ev || 0, confidence, handKey, isRFI,
     handType: classifyHand(state.heroCards[0], state.heroCards[1]),
-    stackDepth: state.stackDepth, stackLabel
+    stackDepth: state.stackDepth, stackLabel,
+    recommendedSize
   };
 }
 
@@ -4237,7 +4276,15 @@ function renderFreqBar(label, pct, color, barClass) {
 }
 
 function renderPreflopDetails(result) {
+  // RFI: show recommended open size
+  const sizeRecommendation = result.isRFI && result.recommendedSize ? 
+    `<div style="background:linear-gradient(90deg,#10B981,#059669);padding:12px 16px;border-radius:8px;margin-bottom:12px;">
+      <div style="font-size:12px;color:rgba(255,255,255,0.8);">推荐开注尺寸</div>
+      <div style="font-size:24px;font-weight:bold;color:white;">${result.recommendedSize.toFixed(1)} BB</div>
+    </div>` : '';
+  
   return `
+  ${sizeRecommendation}
   <div class="ev-chart-area">
     <div class="section-label mb-3">各行动期望收益 (EV)</div>
     <div class="ev-bars">
@@ -4251,6 +4298,7 @@ function renderPreflopDetails(result) {
     <span class="tip-tag">GTO 提示${result.stackLabel || ''}</span>
     ${result.isRFI ?
       `在 ${state.position} 位置首入底池(RFI)${result.stackLabel || ''}，<strong>${result.bestAction==='raise'?'OPEN RAISE':'FOLD'}</strong> 是 GTO 最优策略。
+       ${result.recommendedSize ? `<br>&bull; <strong>推荐开注 ${result.recommendedSize.toFixed(1)} BB</strong>：基于位置和手牌强度的 GTO 尺寸。`:''}
        ${result.raise >= 80 ? '<br>&bull; 强势手牌，属于标准开池范围，应果断加注。':''}
        ${result.fold >= 60 ? '<br>&bull; 不在该位置的 GTO 开池范围内，应弃牌。':''}
        ${result.raise > 0 && result.raise < 80 ? '<br>&bull; 边缘手牌，在该位置有一定开池频率（混合策略）。':''}
