@@ -556,10 +556,7 @@ const PREFLOP_ACTION_CATEGORIES = [
 const PREFLOP_SIZE_OPTIONS = {
   open: null, // RFI uses single-level selection, strategy recommends size
   vslimp: [
-    { label: '隔离 3 BB', val: 'vslimp_iso3', bb: 3.0 },
-    { label: '隔离 4 BB', val: 'vslimp_iso4', bb: 4.0 },
-    { label: '隔离 5 BB', val: 'vslimp_iso5', bb: 5.0 },
-    { label: '平跟入池', val: 'vslimp_call', bb: 1.0 },
+    { label: '有人平跟入池', val: 'vslimp_bp', bb: 1.0 },
   ],
   vsor: [
     { label: '2 BB', val: 'vsor_2', bb: 2.0 },
@@ -2017,6 +2014,31 @@ function getRecommendedOpenSize(handKey, position, raisePct) {
   return baseSize;
 }
 
+/** Get recommended isolation size when facing limp */
+function getRecommendedIsolationSize(handKey, position, raisePct) {
+  // Position-based base isolation sizing
+  const posSizeMap = {
+    'UTG': 4.0, 'UTG+1': 4.0, 'UTG+2': 4.0,
+    'HJ': 3.5, 'CO': 3.5,
+    'BTN': 3.0, 'SB': 4.0, 'BB': 4.0
+  };
+  const baseSize = posSizeMap[position] || 3.5;
+  
+  // Hand strength adjustments
+  const isPremium = ['AA', 'KK', 'QQ', 'JJ', 'AKs', 'AKo'].includes(handKey);
+  const isStrong = raisePct >= 70;
+  const isMarginal = raisePct <= 30;
+  
+  // Premium hands: larger isolation for value
+  if (isPremium) return Math.min(6.0, baseSize + 0.5);
+  // Strong hands: standard+ size
+  if (isStrong) return Math.min(5.0, baseSize + 0.3);
+  // Marginal hands: smaller isolation
+  if (isMarginal) return Math.max(2.5, baseSize - 0.5);
+  
+  return baseSize;
+}
+
 /** Pre-Flop GTO lookup with stack depth awareness */
 function calculatePreflopGTO(handKey, position, facingAction) {
   const baseTableName = getFacingTable(facingAction);
@@ -2059,9 +2081,13 @@ function calculatePreflopGTO(handKey, position, facingAction) {
   const stackLabel = isShortStack ? ' (短筹码 Push/Fold)' : (isDeepStack ? ' (深筹码)' : '');
   
   // For RFI: recommend open size
+  // For facing limp: recommend isolation size
   let recommendedSize = null;
+  const facingCat = getFacingCategory(facingAction);
   if (isRFI && bestAction === 'raise') {
     recommendedSize = getRecommendedOpenSize(handKey, position, raisePct);
+  } else if (facingCat === 'vslimp' && bestAction === 'raise') {
+    recommendedSize = getRecommendedIsolationSize(handKey, position, raisePct);
   }
 
   return {
@@ -2069,7 +2095,8 @@ function calculatePreflopGTO(handKey, position, facingAction) {
     bestAction, ev: entry.ev || 0, confidence, handKey, isRFI,
     handType: classifyHand(state.heroCards[0], state.heroCards[1]),
     stackDepth: state.stackDepth, stackLabel,
-    recommendedSize
+    recommendedSize,
+    facingCategory: facingCat
   };
 }
 
@@ -4276,10 +4303,13 @@ function renderFreqBar(label, pct, color, barClass) {
 }
 
 function renderPreflopDetails(result) {
+  const isVsLimp = result.facingCategory === 'vslimp';
+  
   // RFI: show recommended open size
-  const sizeRecommendation = result.isRFI && result.recommendedSize ? 
+  // Facing Limp: show recommended isolation size
+  const sizeRecommendation = (result.isRFI || isVsLimp) && result.recommendedSize ? 
     `<div style="background:linear-gradient(90deg,#10B981,#059669);padding:12px 16px;border-radius:8px;margin-bottom:12px;">
-      <div style="font-size:12px;color:rgba(255,255,255,0.8);">推荐开注尺寸</div>
+      <div style="font-size:12px;color:rgba(255,255,255,0.8);">${isVsLimp ? '推荐隔离尺寸' : '推荐开注尺寸'}</div>
       <div style="font-size:24px;font-weight:bold;color:white;">${result.recommendedSize.toFixed(1)} BB</div>
     </div>` : '';
   
@@ -4304,10 +4334,18 @@ function renderPreflopDetails(result) {
        ${result.raise > 0 && result.raise < 80 ? '<br>&bull; 边缘手牌，在该位置有一定开池频率（混合策略）。':''}
        ${state.stackDepth <= 25 ? '<br>&bull; <strong>短筹码模式</strong>：采用 Push/Fold 策略，边缘手牌全部弃牌。':''}
        ${state.stackDepth > 120 ? '<br>&bull; <strong>深筹码模式</strong>：投机牌（小对子、同花连张）价值提升，可放宽开池范围。':''}` :
-      `<strong>${(result.bestAction || 'unknown').toUpperCase()}</strong> 是这手牌在当前位置面对当前行动时的 GTO 最优策略。
-       ${result.fold > 60 ? '<br>&bull; 这手牌在此场景下偏弱，GTO 建议主要弃牌。':''}
-       ${result.raise > 60 ? '<br>&bull; 强势手牌，GTO 支持积极加注获取价值。':''}
-       ${result.call > 60 ? '<br>&bull; 中等强度，跟注保持底池控制。':''}`
+      (isVsLimp ?
+        `在 ${state.position} 位置面对 Limp，<strong>${result.bestAction==='raise'?'隔离加注':result.bestAction==='call'?'平跟入池':'弃牌'}</strong> 是 GTO 最优策略。
+         ${result.recommendedSize && result.bestAction==='raise' ? `<br>&bull; <strong>推荐隔离尺寸 ${result.recommendedSize.toFixed(1)} BB</strong>：基于位置、手牌强度和limp人数的 GTO 尺寸。`:''}
+         ${result.raise >= 70 ? '<br>&bull; 强势手牌，建议隔离加注，单独对抗limp玩家获取价值。':''}
+         ${result.call >= 60 ? '<br>&bull; 投机手牌（小对子、同花连张），建议平跟入池看翻牌。':''}
+         ${result.fold >= 60 ? '<br>&bull; 这手牌在此场景下偏弱，GTO 建议弃牌等待更好机会。':''}
+         ${state.stackDepth <= 25 ? '<br>&bull; <strong>短筹码模式</strong>：采用 Push/Fold 策略，边缘手牌全部弃牌。':''}` :
+        `<strong>${(result.bestAction || 'unknown').toUpperCase()}</strong> 是这手牌在当前位置面对当前行动时的 GTO 最优策略。
+         ${result.fold > 60 ? '<br>&bull; 这手牌在此场景下偏弱，GTO 建议主要弃牌。':''}
+         ${result.raise > 60 ? '<br>&bull; 强势手牌，GTO 支持积极加注获取价值。':''}
+         ${result.call > 60 ? '<br>&bull; 中等强度，跟注保持底池控制。':''}`
+      )
     }
     <br><small class="text-slate-500 mt-2 block">基于标准 6-max ${state.stackDepth}BB${result.confidence==='high'?' | GTO 查表命中':' | 智能估算'} | ${state.stackDepth <= 25 ? 'Push/Fold 模式' : (state.stackDepth > 120 ? '深筹码模式' : '标准模式')}</small>
   </div>`;
